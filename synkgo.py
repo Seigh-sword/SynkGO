@@ -13,6 +13,8 @@ PORT = 12345
 FILE_PORT = 12346
 BUFFER = 8192
 
+SESSIONS = {}  
+
 my_ip = None
 my_name = None
 room_id = None
@@ -102,17 +104,10 @@ def load_config():
 def generate_room_id():
     return str(random.randint(1000, 9999))
 
-def broadcast_room():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    msg = f"SYNKGO:{room_id}:{my_name}"
-    while running:
-        sock.sendto(msg.encode(), ('<broadcast>', PORT))
-        time.sleep(3)
-
-def discovery_listener():
+def discovery_loop():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.bind(('', PORT))
     while running:
         try:
@@ -120,11 +115,31 @@ def discovery_listener():
             if addr[0] != my_ip:
                 msg = data.decode()
                 if msg.startswith("SYNKGO:"):
-                    _, rid, name = msg.split(':', 2)
-                    if rid == room_id:
-                        peers[addr[0]] = {'name': name, 'last_seen': time.time()}
+                    parts = msg.split(':')
+                    if len(parts) >= 3 and parts[2] != "LOOKUP":
+                        rid = parts[1]
+                        name = parts[2]
+                        SESSIONS[rid] = {
+                            'hostname': name,
+                            'ip': addr[0],
+                            'last_seen': time.time()
+                        }
+                        if rid == room_id:
+                            peers[addr[0]] = {'name': name, 'last_seen': time.time()}
         except:
             pass
+
+def start_background_discovery():
+    t = threading.Thread(target=discovery_loop, daemon=True)
+    t.start()
+
+def broadcast_room():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    msg = f"SYNKGO:{room_id}:{my_name}"
+    while running:
+        sock.sendto(msg.encode(), ('<broadcast>', PORT))
+        time.sleep(3)
 
 def send_file(ip, filepath):
     filepath_str = str(filepath)
@@ -279,15 +294,15 @@ def monitor_folder_changes():
                     last_file_states[key] = mtime
         time.sleep(2)
 
-def join_room(room_id_to_join):
-    global my_ip, my_name, room_id, room_folder, is_host, running, peers
+def join_room(session_id):
+    global my_ip, my_name, room_id, room_folder, is_host, running, peers, SESSIONS
     
     my_ip = get_local_ip()
     my_name = input(f"{CYAN}Enter your name: {RESET}").strip()
     if not my_name:
         my_name = f"User{random.randint(100,999)}"
     
-    room_id = room_id_to_join
+    room_id = session_id
     room_folder = os.getcwd()
     is_host = False
     
@@ -295,39 +310,28 @@ def join_room(room_id_to_join):
     synkgo_dir.mkdir(exist_ok=True)
     save_config()
     
-    print(f"{GREEN}Looking for room {room_id} on LAN...{RESET}")
+    print(f"{GREEN}Looking for room {session_id} on LAN...{RESET}")
     
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(2)
+    start_background_discovery()
     
-    found_host = None
-    for attempt in range(10):
-        sock.sendto(f"SYNKGO:{room_id}:LOOKUP".encode(), ('<broadcast>', PORT))
-        try:
-            data, addr = sock.recvfrom(1024)
-            decoded = data.decode()
-            if decoded.startswith(f"SYNKGO:{room_id}"):
-                parts = decoded.split(':')
-                if len(parts) >= 3 and parts[2] != "LOOKUP":
-                    found_host = addr[0]
-                    break
-        except socket.timeout:
-            continue
+    found_ip = None
+    for attempt in range(15):
+        if session_id in SESSIONS:
+            found_ip = SESSIONS[session_id]['ip']
+            break
+        time.sleep(1)
     
-    sock.close()
-    
-    if found_host:
-        print(f"{GREEN}Found room at {found_host}{RESET}")
-        threading.Thread(target=discovery_listener, daemon=True).start()
+    if found_ip:
+        print(f"{GREEN}Found room at {found_ip}{RESET}")
         threading.Thread(target=chat_server, daemon=True).start()
         threading.Thread(target=file_server, daemon=True).start()
         threading.Thread(target=monitor_folder_changes, daemon=True).start()
-        peers[found_host] = {'name': 'Host', 'last_seen': time.time()}
+        peers[found_ip] = {'name': SESSIONS[session_id]['hostname'], 'last_seen': time.time()}
         interactive_terminal()
     else:
-        print(f"{RED}Room {room_id} not found on LAN{RESET}")
+        print(f"{RED}Room {session_id} not found on LAN{RESET}")
         print(f"{YELLOW}Make sure the host is running: python synkgo.py -host .{RESET}")
+        print(f"{YELLOW}Then run 'python synkgo.py -list' to see available rooms{RESET}")
         running = False
 
 def interactive_terminal():
@@ -511,8 +515,8 @@ def host_mode(folder):
     print(f"  python synkgo.py -join {room_id}")
     print()
     
+    start_background_discovery()
     threading.Thread(target=broadcast_room, daemon=True).start()
-    threading.Thread(target=discovery_listener, daemon=True).start()
     threading.Thread(target=chat_server, daemon=True).start()
     threading.Thread(target=file_server, daemon=True).start()
     threading.Thread(target=monitor_folder_changes, daemon=True).start()
@@ -523,36 +527,38 @@ def host_mode(folder):
     print(f"{YELLOW}Room closed{RESET}")
 
 def list_mode():
+    global SESSIONS
+    
     clear_screen()
     print(f"{BOLD}Scanning for Synkgo rooms on LAN...{RESET}")
     print()
     
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(('', PORT))
-    sock.settimeout(2)
+    SESSIONS = {}
     
-    found_rooms = {}
-    start_time = time.time()
+    temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    temp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    temp_sock.settimeout(2)
     
-    while time.time() - start_time < 5:
+    for i in range(5):
+        temp_sock.sendto(b"SYNKGO:LOOKUP:LOOKUP", ('<broadcast>', PORT))
         try:
-            data, addr = sock.recvfrom(1024)
-            decoded = data.decode()
-            if decoded.startswith("SYNKGO:"):
-                parts = decoded.split(':')
+            data, addr = temp_sock.recvfrom(1024)
+            msg = data.decode()
+            if msg.startswith("SYNKGO:"):
+                parts = msg.split(':')
                 if len(parts) >= 3 and parts[2] != "LOOKUP":
                     rid = parts[1]
                     name = parts[2]
-                    if rid not in found_rooms:
-                        found_rooms[rid] = {'name': name, 'ip': addr[0]}
+                    if rid not in SESSIONS:
+                        SESSIONS[rid] = {'hostname': name, 'ip': addr[0]}
                         print(f"  {GREEN}Room {rid}{RESET} - {name} at {addr[0]}")
         except socket.timeout:
             pass
+        time.sleep(0.5)
     
-    sock.close()
+    temp_sock.close()
     
-    if not found_rooms:
+    if not SESSIONS:
         print(f"{RED}  No Synkgo rooms found{RESET}")
         print()
         print("Make sure someone is hosting:")
